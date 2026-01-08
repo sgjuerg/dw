@@ -1,0 +1,4 @@
+# local data
+.deepwork/
+*.pyc
+__pycache__/
