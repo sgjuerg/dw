@@ -1,0 +1,563 @@
+#!/usr/bin/env python3
+"""
+Deep Work Logger `dw` v0.1.0 — truthful recorder: Project + Mode + Output
+
+Implements the v0.1.0 public baseline using:
+- CSV log:   ~/.local/share/deepwork/deepwork.csv
+- State:     ~/.local/state/deepwork/active_session.json
+
+Usage:
+  dw start [--min N] [-p PROJECT] [-m MODE] [--force]
+  dw end
+  dw status
+  dw cancel [--yes]
+  dw review --today|--week
+
+Mode list (v0.1.0):
+  build | sell | discover | study | debug | ops | write
+
+End prompts:
+- Output (required): one-line artifact produced
+- Quality: 1-5
+- Distractions: 0 / 1-2 / 3+
+- Interruption: none / soft / hard
+- Blocker (optional): internal stall reason (captured at end)
+- Next Step (optional): resume breadcrumb (smallest true next action)
+
+Schema stance:
+- Clean-break strictness: CSV header must match v0.1.0 exactly; no auto-migration.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime as dt
+import json
+import random
+import re
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+APP_DIR = "deepwork"
+
+DEFAULT_PLANNED_MIN = 90
+STALE_HOURS = 12
+
+MAX_NEXT_STEP_LEN = 200
+MAX_OUTPUT_LEN = 200
+MAX_BLOCKER_LEN = 80
+
+SCHEMA_VERSION = "0.1.0"
+
+CSV_PATH = Path.home() / ".local" / "share" / APP_DIR / "deepwork.csv"
+STATE_PATH = Path.home() / ".local" / "state" / APP_DIR / "active_session.json"
+
+MODE_ALLOWED = {"build", "sell", "discover", "study", "debug", "ops", "write"}
+MODE_ALLOWED_LIST = ["build", "sell", "discover", "study", "debug", "ops", "write"]
+
+DISTRACTIONS_ALLOWED = {"0", "1-2", "3+"}
+INTERRUPTION_MAP = {"n": "none", "s": "soft", "h": "hard"}
+INTERRUPTION_ALLOWED = set(INTERRUPTION_MAP.values())
+
+CSV_HEADER_V010 = [
+    "session_id",
+    "date_local",
+    "start_ts",
+    "end_ts",
+    "planned_min",
+    "actual_min",
+    "quality",
+    "distractions",
+    "interruption",
+    "project",
+    "mode",
+    "output",
+    "blocker",
+    "next_step",
+    "schema_version",
+]
+
+
+def now_local() -> dt.datetime:
+    return dt.datetime.now().astimezone()
+
+
+def iso_zoned(t: dt.datetime) -> str:
+    return t.isoformat(timespec="seconds")
+
+
+def parse_iso_zoned(s: str) -> dt.datetime:
+    return dt.datetime.fromisoformat(s)
+
+
+def ensure_dirs() -> None:
+    CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+
+def ensure_csv_header() -> None:
+    ensure_dirs()
+    if not CSV_PATH.exists():
+        with CSV_PATH.open("w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(CSV_HEADER_V010)
+        return
+
+    with CSV_PATH.open("r", newline="", encoding="utf-8") as f:
+        r = csv.reader(f)
+        try:
+            header = next(r)
+        except StopIteration:
+            header = []
+
+    if header != CSV_HEADER_V010:
+        print("ERROR: deepwork.csv header does not match v0.1.0 schema.")
+        print(f"Expected: {CSV_HEADER_V010}")
+        print(f"Found:    {header}")
+        print("Fix: move/rename the old CSV, then rerun `dw start` to create a fresh v0.1.0 CSV.")
+        raise SystemExit(2)
+
+
+def read_state() -> Optional[Dict[str, Any]]:
+    if not STATE_PATH.exists():
+        return None
+    try:
+        with STATE_PATH.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def write_state(state: Dict[str, Any]) -> None:
+    ensure_dirs()
+    tmp = STATE_PATH.with_suffix(".json.tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+    tmp.replace(STATE_PATH)
+
+
+def clear_state() -> None:
+    try:
+        STATE_PATH.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def gen_session_id(t: dt.datetime) -> str:
+    rand = "".join(random.choices("0123456789abcdef", k=4))
+    return f"{t.strftime('%Y%m%d')}-{t.strftime('%H%M%S')}-{rand}"
+
+
+def minutes_between(a: dt.datetime, b: dt.datetime) -> int:
+    delta = b - a
+    mins = int(round(delta.total_seconds() / 60.0))
+    return max(0, mins)
+
+
+def format_hhmm(t: dt.datetime) -> str:
+    return t.strftime("%H:%M")
+
+
+def normalize_project(s: str) -> str:
+    s = s.strip().lower().replace(" ", "-")
+    s = re.sub(r"[^a-z0-9_-]", "", s)
+    s = s[:24]
+    return s or "learn"
+
+
+def normalize_output(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"(?i)^output:\s*", "", s)
+    s = s.replace("|", "/")
+    s = re.sub(r"\s+", " ", s)
+    if len(s) > MAX_OUTPUT_LEN:
+        s = s[:MAX_OUTPUT_LEN]
+    return s
+
+
+def normalize_blocker(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    s = s.replace("|", "/")
+    if len(s) > MAX_BLOCKER_LEN:
+        s = s[:MAX_BLOCKER_LEN]
+    return s
+
+
+def normalize_next_step(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    s = s.replace("|", "/")
+    if len(s) > MAX_NEXT_STEP_LEN:
+        s = s[:MAX_NEXT_STEP_LEN]
+    return s
+
+
+def prompt_output_required() -> str:
+    while True:
+        s = input("Output (required, one line): ").rstrip("\n")
+        s = normalize_output(s)
+        if s:
+            return s
+        print("Output is required. Write a short one-line artifact produced.")
+
+
+def prompt_quality() -> int:
+    while True:
+        s = input("Quality [1-5]: ").strip()
+        if s in {"1", "2", "3", "4", "5"}:
+            return int(s)
+        print("Enter 1-5.")
+
+
+def prompt_distractions() -> str:
+    while True:
+        s = input("Distractions [0,1-2,3+]: ").strip()
+        if s in DISTRACTIONS_ALLOWED:
+            return s
+        if s == "1":
+            return "1-2"
+        if s == "3":
+            return "3+"
+        print("Enter 0, 1-2, or 3+.")
+
+
+def prompt_interruption() -> str:
+    while True:
+        s = input("Interruption [n=none,s=soft,h=hard]: ").strip().lower()
+        if s in INTERRUPTION_MAP:
+            return INTERRUPTION_MAP[s]
+        if s in INTERRUPTION_ALLOWED:
+            return s
+        print("Enter n, s, or h.")
+
+
+def prompt_blocker_optional() -> str:
+    s = input("Blocker (optional, internal stall): ").rstrip("\n")
+    return normalize_blocker(s)
+
+
+def prompt_next_step_optional() -> str:
+    s = input("Next Step (optional, resume breadcrumb): ").rstrip("\n")
+    return normalize_next_step(s)
+
+
+def stale_prompt_action() -> str:
+    while True:
+        s = input("Active session looks stale. Close(log) / discard / keep? [c/d/k]: ").strip().lower()
+        if s in {"c", "d", "k"}:
+            return s
+        print("Enter c, d, or k.")
+
+
+def append_csv_row(row: Dict[str, Any]) -> None:
+    ensure_csv_header()
+    with CSV_PATH.open("a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_HEADER_V010)
+        w.writerow(row)
+
+
+def read_last_csv_row() -> Optional[Dict[str, str]]:
+    if not CSV_PATH.exists():
+        return None
+    ensure_csv_header()
+    last: Optional[Dict[str, str]] = None
+    with CSV_PATH.open("r", newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            last = row
+    return last
+
+
+def compute_defaults_project_mode() -> Tuple[str, str]:
+    last = read_last_csv_row()
+    if not last:
+        return ("learn", "build")
+    proj = (last.get("project") or "").strip()
+    mode = (last.get("mode") or "").strip().lower()
+    proj = normalize_project(proj) if proj else "learn"
+    mode = mode if mode in MODE_ALLOWED else "build"
+    return (proj, mode)
+
+
+def print_started_line(project: str, mode: str, planned_min: int, start: dt.datetime) -> None:
+    ends = start + dt.timedelta(minutes=planned_min)
+    print(f"Started: p:{project} | m:{mode} | planned {planned_min}m | ends ~ {format_hhmm(ends)}")
+
+
+def print_active_line(state: Dict[str, Any]) -> None:
+    start = parse_iso_zoned(state["start_ts"])
+    planned_min = int(state["planned_min"])
+    project = normalize_project(str(state.get("project", "learn")))
+    mode = str(state.get("mode", "build")).lower() or "build"
+
+    now = now_local()
+    elapsed = minutes_between(start, now)
+    planned_end = start + dt.timedelta(minutes=planned_min)
+
+    print(
+        f"Active: p:{project} | m:{mode} | started {format_hhmm(start)} | "
+        f"elapsed {elapsed}m | planned {planned_min}m | ends ~ {format_hhmm(planned_end)}"
+    )
+
+
+def close_active_session_with_prompts(state: Dict[str, Any]) -> int:
+    start = parse_iso_zoned(state["start_ts"])
+    end = now_local()
+
+    planned_min = int(state.get("planned_min", DEFAULT_PLANNED_MIN))
+    project = normalize_project(str(state.get("project", "learn")))
+    mode = str(state.get("mode", "build")).lower() or "build"
+    session_id = str(state.get("session_id") or gen_session_id(start))
+
+    # Prompts (order must remain tight/consistent)
+    output = prompt_output_required()
+    quality = prompt_quality()
+    distractions = prompt_distractions()
+    interruption = prompt_interruption()
+    blocker = prompt_blocker_optional()
+    next_step = prompt_next_step_optional()
+
+    actual_min = minutes_between(start, end)
+    date_local = start.date().isoformat()
+
+    row = {
+        "session_id": session_id,
+        "date_local": date_local,
+        "start_ts": iso_zoned(start),
+        "end_ts": iso_zoned(end),
+        "planned_min": planned_min,
+        "actual_min": actual_min,
+        "quality": quality,
+        "distractions": distractions,
+        "interruption": interruption,
+        "project": project,
+        "mode": mode,
+        "output": output,
+        "blocker": blocker,
+        "next_step": next_step,
+        "schema_version": SCHEMA_VERSION,
+    }
+    append_csv_row(row)
+    clear_state()
+
+    d_short = "D0" if distractions == "0" else ("D1" if distractions == "1-2" else "D3")
+    print(f"Logged: {actual_min}m | Q{quality} | {d_short} | {interruption}")
+    return 0
+
+
+def cmd_start(args: argparse.Namespace) -> int:
+    ensure_csv_header()
+
+    state = read_state()
+    if state:
+        try:
+            start = parse_iso_zoned(state["start_ts"])
+            age_hours = (now_local() - start).total_seconds() / 3600.0
+        except Exception:
+            age_hours = 0.0
+
+        if age_hours >= STALE_HOURS and not args.force:
+            action = stale_prompt_action()
+            if action == "c":
+                return close_active_session_with_prompts(state)
+            if action == "d":
+                clear_state()
+            if action == "k":
+                try:
+                    print_active_line(state)
+                except Exception:
+                    print("Active session exists. Use: dw status | dw end | dw cancel")
+                return 2
+        else:
+            print("Active session exists. Use: dw status | dw end | dw cancel")
+            return 2
+
+    planned_min = int(args.min) if args.min is not None else DEFAULT_PLANNED_MIN
+
+    default_project, default_mode = compute_defaults_project_mode()
+    project = normalize_project(args.project) if args.project else default_project
+
+    mode = (args.mode.strip().lower() if args.mode else default_mode)
+    if mode not in MODE_ALLOWED:
+        allowed = ",".join(MODE_ALLOWED_LIST)
+        print(f'ERROR: invalid mode "{mode}". Allowed: {allowed}')
+        return 2
+
+    start = now_local()
+    session_id = gen_session_id(start)
+
+    new_state = {
+        "session_id": session_id,
+        "start_ts": iso_zoned(start),
+        "planned_min": planned_min,
+        "project": project,
+        "mode": mode,
+    }
+    write_state(new_state)
+
+    print_started_line(project, mode, planned_min, start)
+    return 0
+
+
+def cmd_end(_: argparse.Namespace) -> int:
+    state = read_state()
+    if not state:
+        print("No active session. Use: dw start")
+        return 2
+    return close_active_session_with_prompts(state)
+
+
+def cmd_status(_: argparse.Namespace) -> int:
+    state = read_state()
+    if not state:
+        print("No active session.")
+        return 0
+    try:
+        print_active_line(state)
+        return 0
+    except Exception:
+        print("Active session exists. Use: dw end | dw cancel")
+        return 0
+
+
+def cmd_cancel(args: argparse.Namespace) -> int:
+    state = read_state()
+    if not state:
+        print("No active session.")
+        return 0
+    if not args.yes:
+        s = input("Cancel active session without logging? [y/N]: ").strip().lower()
+        if s not in {"y", "yes"}:
+            return 0
+    clear_state()
+    print("Canceled.")
+    return 0
+
+
+def read_csv_rows() -> List[Dict[str, str]]:
+    if not CSV_PATH.exists():
+        return []
+    ensure_csv_header()
+    with CSV_PATH.open("r", newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        return list(r)
+
+
+def within_last_days(d: dt.date, days: int, today: dt.date) -> bool:
+    return 0 <= (today - d).days < days
+
+
+def cmd_review(args: argparse.Namespace) -> int:
+    rows = read_csv_rows()
+    if not rows:
+        print("No logs yet.")
+        return 0
+
+    today = now_local().date()
+    if args.today:
+        wanted = lambda d: d == today
+        label = "today"
+    else:
+        wanted = lambda d: within_last_days(d, 7, today)
+        label = "last 7 days"
+
+    filtered: List[Dict[str, str]] = []
+    for row in rows:
+        try:
+            d = dt.date.fromisoformat(row["date_local"])
+        except Exception:
+            continue
+        if wanted(d):
+            filtered.append(row)
+
+    if not filtered:
+        print(f"No sessions in {label}.")
+        return 0
+
+    total_min = 0
+    for row in filtered:
+        try:
+            total_min += int(row.get("actual_min", "0") or "0")
+        except Exception:
+            pass
+
+    print(f"Sessions ({label}): {len(filtered)} | Total: {total_min}m")
+    for row in filtered:
+        try:
+            start = parse_iso_zoned(row["start_ts"])
+            end = parse_iso_zoned(row["end_ts"])
+            hh = f"{format_hhmm(start)}-{format_hhmm(end)}"
+        except Exception:
+            hh = "??"
+
+        date_local = row.get("date_local", "?")
+        mins = row.get("actual_min", "?")
+        q = row.get("quality", "?")
+        d = row.get("distractions", "?")
+        intr = row.get("interruption", "?")
+        project = normalize_project(row.get("project", "learn") or "learn")
+        mode = (row.get("mode", "") or "").lower()
+
+        output = normalize_output(row.get("output", "") or "") or "—"
+        blocker = normalize_blocker(row.get("blocker", "") or "")
+        next_step = normalize_next_step(row.get("next_step", "") or "")
+
+        d_short = "D0" if d == "0" else ("D1" if d == "1-2" else ("D3" if d == "3+" else f"D{d}"))
+
+        base = (
+            f"- {date_local} {hh} | {mins}m | Q{q} | {d_short} | {intr} | "
+            f"p:{project} | m:{mode} | output:{output}"
+        )
+        if blocker:
+            base += f" | blocker:{blocker}"
+        if next_step:
+            base += f" | next_step:{next_step}"
+        print(base)
+
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="dw", add_help=True)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("start", help="Start a deep work session")
+    sp.add_argument("--min", type=int, default=None, help="Planned minutes (default 90)")
+    sp.add_argument("-p", "--project", type=str, default=None, help="Project label (overrides sticky default)")
+    sp.add_argument(
+        "-m",
+        "--mode",
+        type=str,
+        default=None,
+        help="Mode: build,sell,discover,study,debug,ops,write (overrides sticky default)",
+    )
+    sp.add_argument("--force", action="store_true", help="Ignore active-session stale checks (use carefully)")
+    sp.set_defaults(func=cmd_start)
+
+    ep = sub.add_parser("end", help="End and log the active session")
+    ep.set_defaults(func=cmd_end)
+
+    st = sub.add_parser("status", help="Show current session status")
+    st.set_defaults(func=cmd_status)
+
+    cp = sub.add_parser("cancel", help="Cancel active session without logging")
+    cp.add_argument("--yes", action="store_true", help="Skip confirmation prompt")
+    cp.set_defaults(func=cmd_cancel)
+
+    rp = sub.add_parser("review", help="Show minimal review output")
+    g = rp.add_mutually_exclusive_group(required=True)
+    g.add_argument("--today", action="store_true")
+    g.add_argument("--week", action="store_true")
+    rp.set_defaults(func=cmd_review)
+
+    return p
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
