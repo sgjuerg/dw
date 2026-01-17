@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Deep Work Logger `dw` v0.1.0 — truthful recorder: Project + Mode + Output
+Deep Work Logger `dw` v0.1.1 — truthful recorder: Project + Mode + Output
 
-Implements the v0.1.0 public baseline using:
+Implements the v0.1.1 public baseline using:
 - CSV log:   ~/.local/share/deepwork/deepwork.csv
 - State:     ~/.local/state/deepwork/active_session.json
 
@@ -13,7 +13,7 @@ Usage:
   dw cancel [--yes]
   dw review --today|--week
 
-Mode list (v0.1.0):
+Mode list (v0.1.1):
   build | sell | discover | study | debug | ops | write
 
 End prompts:
@@ -21,6 +21,7 @@ End prompts:
 - Quality: 1-5
 - Distractions: 0 / 1-2 / 3+
 - Interruption: none / soft / hard
+- If interruption is hard: optionally adjust end time (HH:MM) or subtract minutes
 - Blocker (optional): internal stall reason (captured at end)
 - Next Step (optional): resume breadcrumb (smallest true next action)
 
@@ -47,6 +48,8 @@ MAX_NEXT_STEP_LEN = 200
 MAX_OUTPUT_LEN = 200
 MAX_BLOCKER_LEN = 80
 
+APP_VERSION = "0.1.1"
+# CSV format version. This must stay stable unless the CSV header/fields change.
 SCHEMA_VERSION = "0.1.0"
 
 CSV_PATH = Path.home() / ".local" / "share" / APP_DIR / "deepwork.csv"
@@ -110,10 +113,10 @@ def ensure_csv_header() -> None:
             header = []
 
     if header != CSV_HEADER_V010:
-        print("ERROR: deepwork.csv header does not match v0.1.0 schema.")
+        print(f"ERROR: deepwork.csv header does not match v{SCHEMA_VERSION} schema.")
         print(f"Expected: {CSV_HEADER_V010}")
         print(f"Found:    {header}")
-        print("Fix: move/rename the old CSV, then rerun `dw start` to create a fresh v0.1.0 CSV.")
+        print(f"Fix: move/rename the old CSV, then rerun `dw start` to create a fresh v{SCHEMA_VERSION} CSV.")
         raise SystemExit(2)
 
 
@@ -231,6 +234,48 @@ def prompt_interruption() -> str:
         print("Enter n, s, or h.")
 
 
+def prompt_hard_interruption_end_adjust(start: dt.datetime, end_now: dt.datetime) -> dt.datetime:
+    """If the user forgot to end the session, allow correcting the end timestamp.
+
+    Input options:
+    - HH:MM (local time) => sets end time to today at HH:MM
+    - N (integer minutes) => subtract N minutes from 'now'
+    - blank => keep 'now'
+    """
+    while True:
+        s = input(
+            "Hard interruption: enter end time HH:MM OR minutes to subtract (N). Blank=now: "
+        ).strip()
+        if s == "":
+            return end_now
+
+        # Minutes to subtract
+        if re.fullmatch(r"\d{1,4}", s):
+            mins = int(s)
+            end = end_now - dt.timedelta(minutes=mins)
+        # HH:MM time
+        elif re.fullmatch(r"\d{1,2}:\d{2}", s):
+            hh_s, mm_s = s.split(":", 1)
+            hh = int(hh_s)
+            mm = int(mm_s)
+            if not (0 <= hh <= 23 and 0 <= mm <= 59):
+                print("Invalid time. Use HH:MM (00:00-23:59).")
+                continue
+            end = end_now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        else:
+            print("Enter HH:MM, or an integer minutes-to-subtract (e.g., 45), or blank.")
+            continue
+
+        if end > end_now:
+            print("End time cannot be in the future.")
+            continue
+        if end < start:
+            print("End time cannot be before the session start.")
+            continue
+
+        return end
+
+
 def prompt_blocker_optional() -> str:
     s = input("Blocker (optional, internal stall): ").rstrip("\n")
     return normalize_blocker(s)
@@ -314,6 +359,8 @@ def close_active_session_with_prompts(state: Dict[str, Any]) -> int:
     quality = prompt_quality()
     distractions = prompt_distractions()
     interruption = prompt_interruption()
+    if interruption == "hard":
+        end = prompt_hard_interruption_end_adjust(start, end)
     blocker = prompt_blocker_optional()
     next_step = prompt_next_step_optional()
 

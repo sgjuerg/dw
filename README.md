@@ -102,6 +102,13 @@ Suggested anchors:
 - **soft** = minor interruption (quick question, brief disruption)
 - **hard** = major interruption (call, urgent issue, forced context switch)
 
+If you answer **hard**, the next prompt lets you backdate the session end:
+
+- enter an **end time** (`HH:MM`), or
+- enter **minutes to subtract** (`N`) from “now”
+
+This is for the real-world case where you get pulled away hard and don’t run `dw end` until later.
+
 ### Blocker (optional)
 
 **What it means:** *internal* stall reason — why progress stopped from the inside.
